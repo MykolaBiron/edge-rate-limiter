@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: gateway
+    metrics_path: /_gw/metrics
+    # Resolves to every replica, so each one is scraped individually.
+    dns_sd_configs:
+      - names: [gateway]
+        type: A
+        port: 8000

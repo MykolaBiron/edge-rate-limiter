@@ -1,0 +1,58 @@
+# Compliance zones: CDN country codes (CF-IPCountry, CloudFront-Viewer-Country, ...)
+# map to a zone. A zone can route to its own upstream (data residency), carry
+# stricter limits (via policy zone_overrides) or be blocked outright.
+zones:
+  eu:
+    countries: [AT, BE, BG, HR, CY, CZ, DK, EE, FI, FR, DE, GR, HU, IE, IT, LV, LT,
+                LU, MT, NL, PL, PT, RO, SK, SI, ES, SE, IS, LI, "NO", CH, GB]  # YAML reads bare NO as false
+    upstream: http://upstream-eu:8001
+  na:
+    countries: [US, CA, MX]
+    upstream: http://upstream-us:8001
+  embargoed:
+    countries: [CU, IR, KP, SY]
+    action: block
+    status: 451
+  tor:
+    countries: [T1]
+    action: block
+    status: 403
+
+# Matched by longest path_prefix first.
+policies:
+  - name: auth-login
+    match: {path_prefix: /auth/login, methods: [POST]}
+    identity: ip            # API keys don't help against credential stuffing
+    strategy: {type: sliding_window, limit: 5, window_ms: 60000, precise: true}
+
+  - name: api
+    match: {path_prefix: /api}
+    strategy:
+      type: composite
+      parts:
+        - {type: token_bucket, capacity: 100, refill_rate: 20}   # burst
+        - {type: fixed_window, limit: 10000, window_ms: 3600000}  # hourly quota
+    zone_overrides:
+      eu:
+        type: composite
+        parts:
+          - {type: token_bucket, capacity: 50, refill_rate: 10}
+          - {type: fixed_window, limit: 5000, window_ms: 3600000}
+
+  - name: uploads
+    match: {path_prefix: /upload, methods: [POST, PUT]}
+    shape: true             # smooth bursts to 5 req/s instead of rejecting them
+    strategy: {type: leaky_bucket, capacity: 20, leak_rate: 5}
+
+  - name: search
+    match: {path_prefix: /search}
+    strategy: {type: sliding_window, limit: 300, window_ms: 60000}
+
+  # Effectively unlimited, so benchmarks measure the limiter's cost rather than 429s.
+  - name: bench
+    match: {path_prefix: /bench}
+    strategy: {type: token_bucket, capacity: 1000000000, refill_rate: 1000000000}
+
+  - name: default
+    match: {path_prefix: /}
+    strategy: {type: fixed_window, limit: 600, window_ms: 60000}

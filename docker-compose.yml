@@ -1,0 +1,92 @@
+x-app: &app
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  image: edge-rate-limiter:local
+  restart: unless-stopped
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    # Pure cache: no persistence. Every limiter key has a TTL, and volatile-ttl evicts
+    # the state closest to expiring anyway, which is the least harmful to lose.
+    command: >
+      redis-server --save "" --appendonly no
+      --maxmemory 512mb --maxmemory-policy volatile-ttl
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  upstream-us:
+    <<: *app
+    command: ["uvicorn", "upstream.app:app", "--host", "0.0.0.0", "--port", "8001",
+              "--loop", "uvloop", "--http", "httptools", "--no-access-log"]
+    environment:
+      REGION: us
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/')"]
+      interval: 5s
+
+  upstream-eu:
+    <<: *app
+    command: ["uvicorn", "upstream.app:app", "--host", "0.0.0.0", "--port", "8001",
+              "--loop", "uvloop", "--http", "httptools", "--no-access-log"]
+    environment:
+      REGION: eu
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/')"]
+      interval: 5s
+
+  gateway:
+    <<: *app
+    deploy:
+      replicas: ${GATEWAY_REPLICAS:-3}
+    environment:
+      GW_REDIS_URL: redis://redis:6379/0
+      GW_UPSTREAM_URL: http://upstream-us:8001
+      GW_POLICIES_FILE: /app/policies.yaml
+      GW_FAIL_MODE: ${GW_FAIL_MODE:-open}
+      GW_TRUSTED_PROXIES: 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+    depends_on:
+      redis: {condition: service_healthy}
+      upstream-us: {condition: service_healthy}
+      upstream-eu: {condition: service_healthy}
+
+  nginx:
+    image: nginx:1.28-alpine
+    ports: ["8080:8080"]
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      gateway: {condition: service_healthy}
+    ulimits:
+      nofile: 65536
+
+  prometheus:
+    image: prom/prometheus:v3.4.0
+    ports: ["9090:9090"]
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:12.0.0
+    ports: ["3000:3000"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/gateway.json
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on: [prometheus]
+
+  # docker compose --profile bench run --rm k6 run /bench/load.js
+  k6:
+    image: grafana/k6:1.0.0
+    profiles: [bench]
+    volumes:
+      - ./bench:/bench
+    environment:
+      TARGET: http://nginx:8080
